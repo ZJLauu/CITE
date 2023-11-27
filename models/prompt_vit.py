@@ -388,7 +388,7 @@ class PromptLearner(nn.Module):
 
         self.tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).to(DEVICE)
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)  # [n_clss * n_attr, len, dim]
+            embedding = clip_model.token_embedding(self.tokenized_prompts).type(dtype)  # [n_clss * n_attr, len, dim]
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
         self.register_buffer("token_suffix", embedding[:, 1 + len_prompts:, :])  # CLS, EOS
 
