@@ -224,6 +224,51 @@ class BERT(nn.Module):
         return text_embeddings.to(DEVICE)
 
 
+@HEADS.register_module()
+class MyTextEmbeddingHead(ClsHead):
+    """Text embedding head."""
+
+    def __init__(self,
+                 text_encoder: dict,
+                 temperature: float = 1.0,
+                 learnable_t: bool = False,
+                 float16: bool = False,
+                 **kwargs):
+        super().__init__(**kwargs)
+
+        dtype = torch.float16 if float16 else torch.float32
+        self.text_encoder = MODELS.build(text_encoder)
+        self.temperature = torch.tensor(temperature, dtype=dtype).to(DEVICE)
+        if learnable_t:
+            self.temperature = nn.Parameter(self.temperature)
+
+    def pre_logits(self, x):
+        if isinstance(x, tuple):
+            x = x[-1]
+        if isinstance(x, list):
+            x = x[-1]  # cls token
+        return x
+
+    def forward(self, x):
+        dtype = x.dtype
+        x = self.pre_logits(x)
+        x = x / x.norm(dim=-1, keepdim=True)
+        weights = self.text_encoder().type(dtype)
+        weights = weights / weights.norm(dim=-1, keepdim=True)
+        t = self.temperature.exp().type(dtype)
+        cls_score = t * x @ weights.type(dtype).t()
+        return cls_score
+
+    def forward_train(self, x, gt_label, **kwargs):
+        cls_score = self.forward(x)
+        losses = self.loss(cls_score, gt_label, **kwargs)
+        return losses
+
+    def simple_test(self, x, **kwargs):
+        cls_score = self.forward(x)
+        return super().simple_test(cls_score, **kwargs)
+
+
 @MODELS.register_module()
 class TextEncoderWithPrompt(nn.Module):
 
