@@ -278,6 +278,7 @@ class TextEncoderWithPrompt(nn.Module):
                  n_attr_per_class: int,
                  n_prompts_per_attr: int,
                  attributes: list,
+                 prompts_init: list,
                  text_feature_file: str = None):
         super().__init__()
         self.n_classes = n_classes
@@ -292,8 +293,8 @@ class TextEncoderWithPrompt(nn.Module):
             return
 
         model, _ = clip.load(arch, device=DEVICE)
-        for name, param in self.model.named_parameters():
-            param.requires_grad_(False)
+        # for name, param in model.named_parameters():
+        #     param.requires_grad_(False)
 
         self.transformer = model.transformer
         self.positional_embedding = model.positional_embedding
@@ -301,7 +302,12 @@ class TextEncoderWithPrompt(nn.Module):
         self.text_projection = model.text_projection
         self.dtype = model.dtype
 
-        self.prompt_learner = PromptLearner(n_classes, n_attr_per_class, n_prompts_per_attr, attributes, model)
+        self.prompt_learner = PromptLearner(n_classes, n_attr_per_class, n_prompts_per_attr,
+                                            attributes, model, prompts_init)
+
+        for name, param in self.named_parameters():
+            if "prompt_learner" not in name:
+                param.requires_grad_(False)
 
     def forward(self):
         if hasattr(self, 'text_embeddings'):
@@ -315,7 +321,7 @@ class TextEncoderWithPrompt(nn.Module):
         # x.shape = [n_cls * n_attr, n_prompts, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]),
-              self.prompt_learner.tokenized_prompts.argmax(dim=-1)] @ self.text_projection  # [n_cls * n_attr, dim]
+        self.prompt_learner.tokenized_prompts.argmax(dim=-1)] @ self.text_projection  # [n_cls * n_attr, dim]
         # x = x[torch.arange(x.shape[0]),
         #       self.prompt_learner.tokenized_prompts.argmax(dim=-1) if not self.has_attributes else
         #       self.prompt_learner.tokenized_prompts[cls_i].argmax(dim=-1)] @ self.text_projection  # [n_attr, dim]
@@ -325,23 +331,39 @@ class TextEncoderWithPrompt(nn.Module):
 
 @MODELS.register_module()
 class PromptLearner(nn.Module):
-    def __init__(self, n_classes, n_attr_per_class, n_prompts_per_attr, attributes, clip_model):
+    def __init__(self, n_classes, n_attr_per_class, n_prompts_per_attr, attributes, clip_model, prompts_init):
         super().__init__()
 
         self.has_attributes = (attributes != [])
+        assert not (not self.has_attributes and prompts_init)
+
+        self._tokenizer = _Tokenizer()
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
 
-        # random initializing class-specific contexts
-        ctx_vectors = torch.empty(n_classes * n_attr_per_class, n_prompts_per_attr, ctx_dim, dtype=dtype)
+        # TODO: Implement no provided attributes but have prompts_init
+        if prompts_init:
+            # use given words to initialize context vectors
+            len_prompts = len(_Tokenizer().encode(prompts_init[0]))
+            prompt_token = clip.tokenize(prompts_init[0])
+            with torch.no_grad():
+                init_embedding = clip_model.token_embedding(prompt_token).type(dtype)
+            ctx_vectors = init_embedding[0, 1: 1 + len_prompts, :]
+            prompt_prefix = prompts_init[0]
 
-        nn.init.normal_(ctx_vectors, std=0.02)
-        prompt_prefix = " ".join(["X"] * n_prompts_per_attr)
+        else:
+            # random initializing class-specific contexts
+            ctx_vectors = torch.empty(n_classes * n_attr_per_class, n_prompts_per_attr, ctx_dim, dtype=dtype)
+
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_prompts_per_attr)
+            len_prompts = n_prompts_per_attr
 
         self.text_prompts = nn.Parameter(ctx_vectors).to(DEVICE)  # to be optimized
-        self._tokenizer = _Tokenizer()
+
         if not self.has_attributes:
-            prompts = [prompt_prefix for i in range(n_classes * n_attr_per_class)]
+            prompts = [prompt_prefix for i in range(n_classes * n_attr_per_class)] if not prompts_init \
+                else [attr for cls_attr in prompts_init for attr in cls_attr]
             # tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).to(DEVICE)
             # with torch.no_grad():
             #     embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
@@ -354,9 +376,7 @@ class PromptLearner(nn.Module):
             #
             # self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         else:
-            prompts = []
-            for cls_attr in attributes:
-                prompts.append(prompt_prefix + " " + attr for attr in cls_attr)
+            prompts = [prompt_prefix + " " + attr for cls_attr in attributes for attr in cls_attr]
             # tokenized_prompts = [torch.cat([clip.tokenize(p) for p in cls_prompt]).to(DEVICE)
             #                      for cls_prompt in prompts]
             # with torch.no_grad():
@@ -370,7 +390,7 @@ class PromptLearner(nn.Module):
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)  # [n_clss * n_attr, len, dim]
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_prompts_per_attr:, :])  # CLS, EOS
+        self.register_buffer("token_suffix", embedding[:, 1 + len_prompts:, :])  # CLS, EOS
 
     def forward(self):
 
