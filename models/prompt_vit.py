@@ -238,9 +238,12 @@ class MyTextEmbeddingHead(ClsHead):
 
         dtype = torch.float16 if float16 else torch.float32
         self.text_encoder = MODELS.build(text_encoder)
+        for name, param in self.text_encoder.named_parameters():
+            if "text_prompts" not in name:
+                param.requires_grad_(False)
         self.temperature = torch.tensor(temperature, dtype=dtype).to(DEVICE)
         if learnable_t:
-            self.temperature = nn.Parameter(self.temperature)
+            self.temperature = nn.Parameter(self.temperature, requires_grad=True)
 
     def pre_logits(self, x):
         if isinstance(x, tuple):
@@ -284,6 +287,7 @@ class TextEncoderWithPrompt(nn.Module):
         self.n_classes = n_classes
         self.n_attr_per_class = n_attr_per_class
         self.has_attributes = (attributes != [])
+        assert not (not self.has_attributes and prompts_init)
         if self.has_attributes:
             assert len(attributes) == n_classes
             for cls in attributes:
@@ -301,18 +305,76 @@ class TextEncoderWithPrompt(nn.Module):
         self.ln_final = model.ln_final
         self.text_projection = model.text_projection
         self.dtype = model.dtype
+        
+        ctx_dim = model.ln_final.weight.shape[0]
 
-        self.prompt_learner = PromptLearner(n_classes, n_attr_per_class, n_prompts_per_attr,
-                                            attributes, model, prompts_init)
+        # TODO: Implement no provided attributes but have prompts_init
+        if prompts_init:
+            # use given words to initialize context vectors
+            len_prompts = len(_Tokenizer().encode(prompts_init[0]))
+            prompt_token = clip.tokenize(prompts_init[0])
+            with torch.no_grad():
+                init_embedding = model.token_embedding(prompt_token).type(self.dtype).to(DEVICE) 
+            ctx_vectors = init_embedding[0, 1: 1 + len_prompts, :]
+            prompt_prefix = prompts_init[0]
 
-        for name, param in self.named_parameters():
-            if "prompt_learner" not in name:
-                param.requires_grad_(False)
+        else:
+            # random initializing class-specific contexts
+            ctx_vectors = torch.empty(n_classes * n_attr_per_class, n_prompts_per_attr, ctx_dim, dtype=self.dtype).to(DEVICE) 
+
+            # nn.init.normal_(ctx_vectors, std=0.02)
+            nn.init.xavier_normal_(ctx_vectors)
+            prompt_prefix = " ".join(["X"] * n_prompts_per_attr)
+            len_prompts = n_prompts_per_attr
+
+        self.text_prompts = nn.Parameter(ctx_vectors, requires_grad=True)  # to be optimized
+
+        if not self.has_attributes:
+            prompts = [prompt_prefix for i in range(n_classes * n_attr_per_class)] if not prompts_init \
+                else [attr for cls_attr in prompts_init for attr in cls_attr]
+            # tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).to(DEVICE)
+            # with torch.no_grad():
+            #     embedding = model.token_embedding(tokenized_prompts).type(dtype)
+            #
+            # # These token vectors will be saved when in save_model(),
+            # # but they should be ignored in load_model() as we want to use
+            # # those computed using the current class names
+            # self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+            # self.register_buffer("token_suffix", embedding[:, 1 + n_prompts_per_attr:, :])  # CLS, EOS
+            #
+            # self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        else:
+            prompts = [prompt_prefix + " " + attr for cls_attr in attributes for attr in cls_attr]
+            # tokenized_prompts = [torch.cat([clip.tokenize(p) for p in cls_prompt]).to(DEVICE)
+            #                      for cls_prompt in prompts]
+            # with torch.no_grad():
+            #     embedding = torch.stack([model.token_embedding(tokenized_prompt).type(dtype)
+            #                              for tokenized_prompt in tokenized_prompts]).to(DEVICE)
+            # self.register_buffer("token_prefix", embedding[:, :, :1, :])  # SOS
+            # self.register_buffer("token_suffix", embedding[:, :, 1 + n_prompts_per_attr:, :])  # CLS, EOS
+            # self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+
+        self.tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).to(DEVICE)
+        with torch.no_grad():
+            embedding = model.token_embedding(self.tokenized_prompts).type(self.dtype)  # [n_clss * n_attr, len, dim]
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + len_prompts:, :])  # CLS, EOS
+
+    def get_prompt_embedding(self):
+        prompts = torch.cat(
+            [
+                self.token_prefix,  # (n_clss * n_attr, 1, dim)
+                self.text_prompts,  # (n_clss * n_attr, n_prompts_per_attr, dim)
+                self.token_suffix,  # (n_clss * n_attr, *, dim)
+            ],
+            dim=1,
+        )
+        return prompts
 
     def forward(self):
         if hasattr(self, 'text_embeddings'):
             return self.text_embeddings.to(DEVICE)
-        x = self.prompt_learner() + self.positional_embedding.type(self.dtype)
+        x = self.get_prompt_embedding() + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
@@ -321,25 +383,25 @@ class TextEncoderWithPrompt(nn.Module):
         # x.shape = [n_cls * n_attr, n_prompts, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]),
-        self.prompt_learner.tokenized_prompts.argmax(dim=-1)] @ self.text_projection  # [n_cls * n_attr, dim]
+        self.tokenized_prompts.argmax(dim=-1)] @ self.text_projection  # [n_cls * n_attr, dim]
         # x = x[torch.arange(x.shape[0]),
         #       self.prompt_learner.tokenized_prompts.argmax(dim=-1) if not self.has_attributes else
         #       self.prompt_learner.tokenized_prompts[cls_i].argmax(dim=-1)] @ self.text_projection  # [n_attr, dim]
 
-        return x.continguous().view(self.n_classes, self.n_attr_per_class, -1).mean(dim=1)  # [n_cls, dim]
+        return x.contiguous().view(self.n_classes, self.n_attr_per_class, -1).mean(dim=1)  # [n_cls, dim]
 
 
 @MODELS.register_module()
 class PromptLearner(nn.Module):
-    def __init__(self, n_classes, n_attr_per_class, n_prompts_per_attr, attributes, clip_model, prompts_init):
+    def __init__(self, n_classes, n_attr_per_class, n_prompts_per_attr, attributes, model, prompts_init):
         super().__init__()
 
         self.has_attributes = (attributes != [])
-        assert not (not self.has_attributes and prompts_init)
+        
 
         self._tokenizer = _Tokenizer()
-        dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
+        dtype = model.dtype
+        ctx_dim = model.ln_final.weight.shape[0]
 
         # TODO: Implement no provided attributes but have prompts_init
         if prompts_init:
@@ -347,7 +409,7 @@ class PromptLearner(nn.Module):
             len_prompts = len(_Tokenizer().encode(prompts_init[0]))
             prompt_token = clip.tokenize(prompts_init[0])
             with torch.no_grad():
-                init_embedding = clip_model.token_embedding(prompt_token).type(dtype)
+                init_embedding = model.token_embedding(prompt_token).type(dtype)
             ctx_vectors = init_embedding[0, 1: 1 + len_prompts, :]
             prompt_prefix = prompts_init[0]
 
@@ -366,7 +428,7 @@ class PromptLearner(nn.Module):
                 else [attr for cls_attr in prompts_init for attr in cls_attr]
             # tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).to(DEVICE)
             # with torch.no_grad():
-            #     embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+            #     embedding = model.token_embedding(tokenized_prompts).type(dtype)
             #
             # # These token vectors will be saved when in save_model(),
             # # but they should be ignored in load_model() as we want to use
@@ -380,7 +442,7 @@ class PromptLearner(nn.Module):
             # tokenized_prompts = [torch.cat([clip.tokenize(p) for p in cls_prompt]).to(DEVICE)
             #                      for cls_prompt in prompts]
             # with torch.no_grad():
-            #     embedding = torch.stack([clip_model.token_embedding(tokenized_prompt).type(dtype)
+            #     embedding = torch.stack([model.token_embedding(tokenized_prompt).type(dtype)
             #                              for tokenized_prompt in tokenized_prompts]).to(DEVICE)
             # self.register_buffer("token_prefix", embedding[:, :, :1, :])  # SOS
             # self.register_buffer("token_suffix", embedding[:, :, 1 + n_prompts_per_attr:, :])  # CLS, EOS
@@ -388,7 +450,7 @@ class PromptLearner(nn.Module):
 
         self.tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).to(DEVICE)
         with torch.no_grad():
-            embedding = clip_model.token_embedding(self.tokenized_prompts).type(dtype)  # [n_clss * n_attr, len, dim]
+            embedding = model.token_embedding(self.tokenized_prompts).type(dtype)  # [n_clss * n_attr, len, dim]
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
         self.register_buffer("token_suffix", embedding[:, 1 + len_prompts:, :])  # CLS, EOS
 
