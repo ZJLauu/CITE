@@ -236,12 +236,12 @@ class MyTextEmbeddingHead(ClsHead):
                  **kwargs):
         super().__init__(**kwargs)
 
-        dtype = torch.float16 if float16 else torch.float32
+        self.dtype = torch.float16 if float16 else torch.float32
         self.text_encoder = MODELS.build(text_encoder)
         for name, param in self.text_encoder.named_parameters():
             if "text_prompts" not in name:
                 param.requires_grad_(False)
-        self.temperature = torch.tensor(temperature, dtype=dtype).to(DEVICE)
+        self.temperature = torch.tensor(temperature, dtype=self.dtype).to(DEVICE)
         if learnable_t:
             self.temperature = nn.Parameter(self.temperature, requires_grad=True)
 
@@ -253,13 +253,12 @@ class MyTextEmbeddingHead(ClsHead):
         return x
 
     def forward(self, x):
-        dtype = x.dtype
-        x = self.pre_logits(x)
+        x = self.pre_logits(x).type(self.dtype)
         x = x / x.norm(dim=-1, keepdim=True)
-        weights = self.text_encoder().type(dtype)
+        weights = self.text_encoder().type(self.dtype)
         weights = weights / weights.norm(dim=-1, keepdim=True)
-        t = self.temperature.exp().type(dtype)
-        cls_score = t * x @ weights.type(dtype).t()
+        t = self.temperature.exp().type(self.dtype)
+        cls_score = t * x @ weights.type(self.dtype).t()
         return cls_score
 
     def forward_train(self, x, gt_label, **kwargs):
